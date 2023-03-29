@@ -1,0 +1,6 @@
+apiVersion: v2
+name: traefik2dns
+description: This helm chart install the small utility traefik2dns which is used to manage DNS entries created by Traefik IngressRoute resources
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

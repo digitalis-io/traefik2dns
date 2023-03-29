@@ -1,0 +1,58 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "traefik2dns.serviceAccountName" . }}
+  labels:
+    {{- include "traefik2dns.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+    - extensions
+    - networking.k8s.io
+    resources:
+    - ingressclasses
+    - ingresses
+    - ingresses/status
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - traefik.containo.us
+    resources:
+    - ingressroutes
+    - ingressroutetcps
+    - ingressrouteudps
+  - apiGroups:
+    - externaldns.k8s.io
+    resources:
+    - dnsendpoints
+    verbs:
+    - get
+    - list
+    - watch
+    - create
+    - delete
+    - update
+  - apiGroups:
+    - externaldns.k8s.io
+    resources:
+    - dnsendpoints/status
+    verbs:
+    - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "traefik2dns.serviceAccountName" . }}
+  labels:
+    {{- include "traefik2dns.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "traefik2dns.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "traefik2dns.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

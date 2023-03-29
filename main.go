@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	crd "github.com/traefik/traefik/v2/pkg/provider/kubernetes/crd/generated/clientset/versioned"
@@ -52,18 +53,21 @@ func main() {
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalln(err.Error())
+		return
 	}
 
 	traefikClient, err := crd.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
+		return
 	}
 
-	lbIPs, err := getLoadBalancerIP("app.kubernetes.io/instance=traefik-traefik")
+	lbIPs, err := getLoadBalancerIP()
 	if err != nil {
-		panic(err)
+		log.Fatalf("Could not get load balancer IP(s): %v\n", err)
+		return
 	}
-	fmt.Printf("Detected load balancer IPs as %v\n", lbIPs)
+	log.Printf("Detected load balancer IPs as %v\n", lbIPs)
 
 	// create an informer to watch for changes in IngressRoute objects
 	informer := cache.NewSharedIndexInformer(
@@ -84,25 +88,36 @@ func main() {
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			ingressRoute := obj.(*v1alpha1.IngressRoute)
-			fmt.Printf("IngressRoute %s/%s added\n", ingressRoute.Namespace, ingressRoute.Name)
+			log.Printf("IngressRoute %s/%s added\n", ingressRoute.Namespace, ingressRoute.Name)
 			if h := hosToAdd(ingressRoute.Annotations); h != "" {
-				fmt.Printf("Adding DNS entries for %s\n", h)
-				createDNSRecord(h, ingressRoute.Namespace, lbIPs)
+				hostsList := strings.Split(strings.Replace(h, " ", "", -1), ",")
+				for _, host := range hostsList {
+					log.Printf("Adding DNS entries for %s\n", host)
+					createDNSRecord(h, ingressRoute.Namespace, lbIPs)
+				}
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			ingressRoute := newObj.(*v1alpha1.IngressRoute)
-			fmt.Printf("IngressRoute %s/%s updated\n", ingressRoute.Namespace, ingressRoute.Name)
+			log.Printf("IngressRoute %s/%s updated\n", ingressRoute.Namespace, ingressRoute.Name)
+			// if err := updateDNSRecord(ingressRoute.Name, ingressRoute.Namespace, ingressRoute); err != nil {
+			// 	log.Fatalf("Could not update DNSentry %s/%s: %v\n", ingressRoute.Namespace, ingressRoute.Name, err)
+			// }
 		},
 		DeleteFunc: func(obj interface{}) {
 			ingressRoute := obj.(*v1alpha1.IngressRoute)
 			if ingressRoute.Annotations["managed-by"] == "traefik2dns" {
-				fmt.Printf("IngressRoute %s/%s deleted\n", ingressRoute.Namespace, ingressRoute.Name)
-				if err := deleteDNSRecord(ingressRoute.Name, ingressRoute.Namespace); err != nil {
-					fmt.Printf("Error deleting record: %v\n", err)
+				log.Printf("IngressRoute %s/%s deleted\n", ingressRoute.Namespace, ingressRoute.Name)
+				if h := hosToAdd(ingressRoute.Annotations); h != "" {
+					hostsList := strings.Split(strings.Replace(h, " ", "", -1), ",")
+					for _, host := range hostsList {
+						if err := deleteDNSRecord(host, ingressRoute.Namespace); err != nil {
+							log.Printf("Error deleting record: %v\n", err)
+						}
+					}
 				}
 			} else {
-				fmt.Printf("IngressRoute %s/%s is not managed by traefik2dns. Ignored.\n", ingressRoute.Namespace, ingressRoute.Name)
+				log.Printf("IngressRoute %s/%s is not managed by traefik2dns. Ignored.\n", ingressRoute.Namespace, ingressRoute.Name)
 			}
 		},
 	})
@@ -110,7 +125,7 @@ func main() {
 	// start the informer and wait for changes
 	informer.Run(make(chan struct{}))
 	for {
-		time.Sleep(time.Second)
+		time.Sleep(time.Second * 30)
 	}
 }
 
@@ -124,12 +139,15 @@ func hosToAdd(anns map[string]string) string {
 	return ""
 }
 
-func getLoadBalancerIP(labels string) ([]string, error) {
+func getLoadBalancerIP() ([]string, error) {
 	var ips []string
+
+	labels := getEnv("TRAEFIK_LABEL", "app.kubernetes.io/instance=traefik-traefik")
+	ns := getEnv("TRAEFIK_NAMESPACE", "traefik")
 	opts := metav1.ListOptions{
 		LabelSelector: labels,
 	}
-	services, err := clientset.CoreV1().Services("").List(ctx, opts)
+	services, err := clientset.CoreV1().Services(ns).List(ctx, opts)
 	if err != nil {
 		return ips, err
 	}
@@ -153,7 +171,12 @@ func getLoadBalancerIP(labels string) ([]string, error) {
 	return ips, err
 }
 
-func deleteDNSRecord(name string, namespace string) error {
+func updateDNSRecord(name string, namespace string, lbIPs []string) error {
+
+	return nil
+}
+
+func deleteDNSRecord(dnsName string, namespace string) error {
 	var err error
 
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -161,9 +184,9 @@ func deleteDNSRecord(name string, namespace string) error {
 			Delete().
 			AbsPath("/apis/externaldns.k8s.io/v1alpha1").
 			Namespace(namespace).
-			Name(name).
+			Name(dnsName).
 			Body(&metav1.DeleteOptions{}).
-			Do().
+			Do(ctx).
 			Error()
 		if err != nil {
 			return err
@@ -229,4 +252,11 @@ func getIPs(hostname string) ([]string, error) {
 		return ips, err
 	}
 	return ips, err
+}
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
 }
