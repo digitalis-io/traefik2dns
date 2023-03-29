@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	crd "github.com/traefik/traefik/v2/pkg/provider/kubernetes/crd/generated/clientset/versioned"
@@ -69,6 +70,18 @@ func main() {
 	}
 	log.Printf("Detected load balancer IPs as %v\n", lbIPs)
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		watchIngressRoute(traefikClient, lbIPs)
+		watchIngressRouteTCP(traefikClient, lbIPs)
+		wg.Done()
+	}()
+	wg.Wait()
+}
+
+func watchIngressRoute(traefikClient *crd.Clientset, lbIPs []string) {
+	log.Printf("Watching for changes to IngressRoute\n")
 	// create an informer to watch for changes in IngressRoute objects
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
@@ -118,6 +131,68 @@ func main() {
 				}
 			} else {
 				log.Printf("IngressRoute %s/%s is not managed by traefik2dns. Ignored.\n", ingressRoute.Namespace, ingressRoute.Name)
+			}
+		},
+	})
+
+	// start the informer and wait for changes
+	informer.Run(make(chan struct{}))
+	for {
+		time.Sleep(time.Second * 30)
+	}
+}
+
+func watchIngressRouteTCP(traefikClient *crd.Clientset, lbIPs []string) {
+	log.Printf("Watching for changes to IngressRouteTCP\n")
+	// create an informer to watch for changes in IngressRouteTCP objects
+	informer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				return traefikClient.TraefikV1alpha1().IngressRouteTCPs("").List(ctx, options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				return traefikClient.TraefikV1alpha1().IngressRouteTCPs("").Watch(ctx, options)
+			},
+		},
+		&v1alpha1.IngressRouteTCP{},
+		0, // don't resync
+		cache.Indexers{},
+	)
+
+	// add an event handler for changes to IngressRouteTCP objects
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			IngressRouteTCP := obj.(*v1alpha1.IngressRouteTCP)
+			log.Printf("IngressRouteTCP %s/%s added\n", IngressRouteTCP.Namespace, IngressRouteTCP.Name)
+			if h := hosToAdd(IngressRouteTCP.Annotations); h != "" {
+				hostsList := strings.Split(strings.Replace(h, " ", "", -1), ",")
+				for _, host := range hostsList {
+					log.Printf("Adding DNS entries for %s\n", host)
+					createDNSRecord(h, IngressRouteTCP.Namespace, lbIPs)
+				}
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			IngressRouteTCP := newObj.(*v1alpha1.IngressRouteTCP)
+			log.Printf("IngressRouteTCP %s/%s updated\n", IngressRouteTCP.Namespace, IngressRouteTCP.Name)
+			// if err := updateDNSRecord(IngressRouteTCP.Name, IngressRouteTCP.Namespace, IngressRouteTCP); err != nil {
+			// 	log.Fatalf("Could not update DNSentry %s/%s: %v\n", IngressRouteTCP.Namespace, IngressRouteTCP.Name, err)
+			// }
+		},
+		DeleteFunc: func(obj interface{}) {
+			IngressRouteTCP := obj.(*v1alpha1.IngressRouteTCP)
+			if IngressRouteTCP.Annotations["managed-by"] == "traefik2dns" {
+				log.Printf("IngressRouteTCP %s/%s deleted\n", IngressRouteTCP.Namespace, IngressRouteTCP.Name)
+				if h := hosToAdd(IngressRouteTCP.Annotations); h != "" {
+					hostsList := strings.Split(strings.Replace(h, " ", "", -1), ",")
+					for _, host := range hostsList {
+						if err := deleteDNSRecord(host, IngressRouteTCP.Namespace); err != nil {
+							log.Printf("Error deleting record: %v\n", err)
+						}
+					}
+				}
+			} else {
+				log.Printf("IngressRouteTCP %s/%s is not managed by traefik2dns. Ignored.\n", IngressRouteTCP.Namespace, IngressRouteTCP.Name)
 			}
 		},
 	})
